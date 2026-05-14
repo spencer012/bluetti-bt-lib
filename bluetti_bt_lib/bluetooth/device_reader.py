@@ -249,12 +249,17 @@ class DeviceReader:
                     return
 
             if self.encryption.unsecure_aes_key is None:
-                self.logger.error(
+                self.logger.warning(
                     "Received encrypted message before key initialization"
                 )
+                return
 
             key, iv = self.encryption.getKeyIv()
-            decrypted = Message(self.encryption.aes_decrypt(message.buffer, key, iv))
+            try:
+                decrypted = Message(self.encryption.aes_decrypt(message.buffer, key, iv))
+            except ValueError as err:
+                self.logger.debug("Ignoring invalid encrypted notification: %s", err)
+                return
 
             if decrypted.is_pre_key_exchange:
                 decrypted.verify_checksum()
@@ -275,6 +280,9 @@ class DeviceReader:
         self.notify_response.extend(data)
 
         if self.notify_future is None:
+            return
+
+        if self.notify_future.done():
             return
 
         self.notify_future.set_result(self.notify_response)

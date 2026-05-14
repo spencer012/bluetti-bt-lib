@@ -2,7 +2,7 @@ import asyncio
 import unittest
 
 from bluetti_bt_lib.base_devices import BaseDeviceV1
-from bluetti_bt_lib import DeviceReader
+from bluetti_bt_lib import DeviceReader, DeviceReaderConfig
 from bluetti_bt_lib.fields import FieldName
 from bluetti_bt_lib.utils.bleak_client_mock import ClientMockNoEncryption
 
@@ -61,3 +61,20 @@ class TestDeviceReader(unittest.IsolatedAsyncioTestCase):
         data = await reader.read()
 
         self.assertIsNone(data.get(FieldName.BATTERY_SOC.value))
+
+    async def test_invalid_encrypted_notification_is_ignored(self):
+        device = BaseDeviceV1()
+        reader = DeviceReader(
+            "00:11:00:11:00:11",
+            device,
+            asyncio.Future,
+            DeviceReaderConfig(use_encryption=True),
+            ble_client=self.ble_mock,
+        )
+        reader.encryption.unsecure_aes_key = bytes(16)
+        reader.encryption.unsecure_aes_iv = bytes(16)
+        reader.notify_future = asyncio.Future()
+
+        await reader._notification_handler(0, bytearray(b"\x00\x01abcde"))
+
+        self.assertFalse(reader.notify_future.done())
