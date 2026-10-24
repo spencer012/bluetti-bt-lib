@@ -27,7 +27,7 @@ async def async_read_device(address: str, type: str, encryption: bool):
     data = await reader.read()
 
     if data is None:
-        print("Error")
+        print(f"Error: {reader.last_error}")
         return
 
     print()

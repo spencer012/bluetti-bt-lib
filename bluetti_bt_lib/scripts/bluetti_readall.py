@@ -32,7 +32,7 @@ async def async_read_device(address: str, iot_version: int, encryption: bool):
     )
 
     if data is None:
-        print("Error")
+        print(f"Error: {reader.last_error}")
         return
 
     print("Writing data to file")

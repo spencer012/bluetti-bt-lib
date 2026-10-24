@@ -3,7 +3,7 @@ import logging
 import async_timeout
 from typing import Any, Callable, List, cast
 from bleak import BleakClient, BleakScanner
-from bleak.exc import BleakError
+from bleak.exc import BleakCharacteristicNotFoundError, BleakError
 from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
 
 from .encryption import BluettiEncryption, Message, MessageType
@@ -51,6 +51,11 @@ class DeviceReader:
         self.notify_future: asyncio.Future[Any] | None = None
         self.encryption = BluettiEncryption()
 
+        self.last_error: str | None = None
+        """Why the last read returned None, if it did"""
+
+        self._notification_error: Exception | None = None
+
     async def read(
         self, only_registers: List[ReadableRegisters] | None = None, raw: bool = False
     ) -> dict | None:
@@ -67,6 +72,9 @@ class DeviceReader:
         self.logger.debug("Reading device registers")
 
         async with self.polling_lock:
+            self.last_error = None
+            self._notification_error = None
+
             try:
                 async with async_timeout.timeout(self.config.timeout):
                     self.logger.debug("Searching for device")
@@ -79,8 +87,8 @@ class DeviceReader:
                         )
 
                         if self.device is None:
-                            self.logger.error("Device not found")
-                            return
+                            self._set_error("Device not found")
+                            return None
 
                     self.logger.debug("Connecting to device")
 
@@ -104,12 +112,16 @@ class DeviceReader:
 
                     self.logger.debug("Notification handler setup complete")
 
+                    if self.config.use_encryption:
+                        self.logger.debug("Waiting for encryption handshake")
+
                     while (
                         self.config.use_encryption
                         and not self.encryption.is_ready_for_commands
                     ):
-                        await asyncio.sleep(5)
-                        self.logger.debug("Encryption handshake not finished yet")
+                        if self._notification_error is not None:
+                            raise self._notification_error
+                        await asyncio.sleep(0.1)
 
                     for register in registers:
                         body = register.parse_response(
@@ -166,35 +178,64 @@ class DeviceReader:
                             parsed_data.update(parsed)
 
             except TimeoutError:
-                self.logger.warning("Timeout")
+                self._set_error("Timeout")
+                return None
+            except BleakCharacteristicNotFoundError as err:
+                # The cached GATT services are stale; rediscover them next time
+                self._set_error(f"Bleak error: {err}")
+                await self._clear_service_cache()
                 return None
             except BleakError as err:
-                self.logger.warning("Bleak error: %s", err)
+                self._set_error(f"Bleak error: {err}")
                 return None
-            except BaseException as err:
-                self.logger.warning("Unknown error %s", err)
+            except Exception as err:
+                self._set_error(f"Unknown error: {err!r}")
                 return None
             finally:
                 if self.has_notifier:
                     try:
                         await self.client.stop_notify(NOTIFY_UUID)
                         self.logger.debug("Stopped notifier")
-                    except:
+                    except Exception:
                         # Ignore errors here
                         pass
                     self.has_notifier = False
                 if self.client:
-                    await self.client.disconnect()
-                    self.logger.debug("Disconnected from device")
+                    try:
+                        await self.client.disconnect()
+                        self.logger.debug("Disconnected from device")
+                    except Exception as err:
+                        self.logger.debug("Error while disconnecting: %s", err)
 
-            # Reset Encryption keys
-            self.encryption.reset()
+                # Reset encryption keys, also after a failed read. Otherwise the
+                # next read skips the handshake and uses the old session key.
+                self.encryption.reset()
 
             # Check if dict is empty
             if not parsed_data:
+                self._set_error("No data received")
                 return None
 
             return parsed_data
+
+    def _set_error(self, error: str):
+        """Record why the read failed.
+
+        Logged at debug only: single failed polls are common over BLE, so
+        callers decide when a failure is worth reporting (see last_error).
+        """
+        self.last_error = error
+        self.logger.debug("Read failed: %s", error)
+
+    async def _clear_service_cache(self):
+        clear_cache = getattr(self.client, "clear_cache", None)
+        if clear_cache is None:
+            return
+        try:
+            await clear_cache()
+            self.logger.debug("Cleared GATT service cache")
+        except Exception as err:
+            self.logger.debug("Failed to clear GATT service cache: %s", err)
 
     async def _async_send_command(self, registers: DeviceRegister) -> bytes:
         """Send command and return response"""
@@ -224,13 +265,25 @@ class DeviceReader:
             self.logger.debug("Got response")
 
             return cast(bytes, res)
-        except:
-            self.logger.warning("Error while reading data")
+        except asyncio.TimeoutError:
+            self.logger.debug("No response for %s", registers)
 
         return bytes()
 
     async def _notification_handler(self, _: int, data: bytearray):
-        """Handle bt data."""
+        """Handle bt data.
+
+        Bleak runs this callback as a task, so an exception raised here would
+        only be logged as "Task exception was never retrieved". Keep it for
+        read() instead, which aborts a pending handshake with it.
+        """
+        try:
+            await self._handle_notification(data)
+        except Exception as err:
+            self.logger.debug("Error handling notification: %s", err)
+            self._notification_error = err
+
+    async def _handle_notification(self, data: bytearray):
         self.logger.debug("Got new data")
 
         if self.config.use_encryption is True:
@@ -249,8 +302,8 @@ class DeviceReader:
                     return
 
             if self.encryption.unsecure_aes_key is None:
-                self.logger.warning(
-                    "Received encrypted message before key initialization"
+                self.logger.debug(
+                    "Ignoring encrypted message received before key initialization"
                 )
                 return
 
